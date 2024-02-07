@@ -3,7 +3,7 @@ name: Build Release
 
 on:
   release:
-    types: [created, published, released]
+    types: [released]
 
 permissions:
     contents: write

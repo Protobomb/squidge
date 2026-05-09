@@ -1,36 +1,112 @@
-# .github/workflows/release.yaml
+# .github/workflows/build_release.yml
+#
+# Cross-compiles Go binaries on each platform/arch and uploads them as
+# release assets. Runs on both GitHub Actions and Forgejo Actions.
+#
+# Differences vs. the previous version:
+# - Replaced wangyoucao577/go-release-action (hard-wires api.github.com)
+#   with inline build + a host-aware curl upload step.
+# - Added workflow_dispatch so it can be manually triggered (especially
+#   useful on Forgejo mirror repos where release events don't always
+#   propagate from upstream).
 name: Build Release
 
 on:
   release:
     types: [released]
+  workflow_dispatch:
 
 permissions:
-    contents: write
-    packages: write
+  contents: write
+  packages: write
 
 jobs:
   releases-matrix:
-    name: Release Go Binary
+    name: Release ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        # build and publish in parallel: linux/386, linux/amd64, linux/arm64, windows/386, windows/amd64, darwin/amd64, darwin/arm64
         goos: [linux, windows, darwin]
         goarch: ["386", amd64, arm64]
         exclude:
-          - goarch: "386"
-            goos: darwin
-          - goarch: arm64
-            goos: windows
+          - { goos: darwin, goarch: "386" }
+          - { goos: windows, goarch: arm64 }
     steps:
-    - uses: actions/checkout@v3
-    - uses: wangyoucao577/go-release-action@v1.46
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: ${{ matrix.goos }}
-        goarch: ${{ matrix.goarch }}
-        # goversion: "https://dl.google.com/go/go1.13.1.linux-amd64.tar.gz"
-        # project_path: "./cmd/test-binary"
-        # binary_name: "test-binary"
-        # extra_files: LICENSE README.md
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build and package
+        id: pkg
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          BIN=squidge
+          [ "$GOOS" = "windows" ] && BIN=squidge.exe
+          go build -ldflags '-s -w' -trimpath -o "$BIN" .
+
+          # On manual dispatch GITHUB_REF_NAME is the branch (e.g. "main"),
+          # which makes for a less-useful asset name. Prefer the tag of
+          # the release if we got triggered by one.
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            TAG=$(jq -r '.release.tag_name' "$GITHUB_EVENT_PATH")
+          fi
+
+          ASSET="squidge-${TAG}-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = "windows" ]; then
+            zip "${ASSET}.zip" "$BIN"
+            echo "file=${ASSET}.zip"      >> "$GITHUB_OUTPUT"
+            echo "type=application/zip"   >> "$GITHUB_OUTPUT"
+          else
+            tar czf "${ASSET}.tar.gz" "$BIN"
+            echo "file=${ASSET}.tar.gz"   >> "$GITHUB_OUTPUT"
+            echo "type=application/gzip"  >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release (host-aware)
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          ASSET_FILE: ${{ steps.pkg.outputs.file }}
+          ASSET_TYPE: ${{ steps.pkg.outputs.type }}
+          TAG:        ${{ steps.pkg.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Look up the release id by tag. $GITHUB_API_URL is set by both
+          # GitHub (api.github.com) and Forgejo (the instance API root).
+          RELEASE_ID=$(curl -fsSL \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            | jq -r .id)
+
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "No release found for tag '$TAG'." >&2
+            echo "Create a release for this tag (or invoke this workflow from a release event)." >&2
+            exit 1
+          fi
+
+          # Forgejo and GitHub use different upload conventions:
+          #   - Forgejo:  multipart/form-data with field name 'attachment',
+          #               POST to the same API host.
+          #   - GitHub:   raw body with the file's content-type, POST to
+          #               uploads.github.com (separate host).
+          if [ "${GITEA_ACTIONS:-false}" = "true" ]; then
+            curl -fsSL -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -F "attachment=@${ASSET_FILE};type=${ASSET_TYPE}" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET_FILE"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: $ASSET_TYPE" \
+              --data-binary "@$ASSET_FILE" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET_FILE"
+          fi
